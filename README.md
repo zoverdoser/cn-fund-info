@@ -6,7 +6,7 @@ Outputs structured Markdown (tables + lists) that LLMs can easily reference in c
 
 ## Features
 
-- **Fund basics**: type, founded date, scale, manager, purchase status, management/custody fees
+- **Fund basics**: type, founded date, scale, manager, purchase/redemption status, purchase minimum, daily purchase limit, management/custody fees
 - **Performance metrics**: 1M/3M/1Y returns, peer ranking, Sharpe ratio (1Y), max drawdown (1Y)
 - **Top 10 holdings**: code, name, ratio, market value — with report period
 - **NAV history**: with automatic sampling (daily ≤90d / weekly ≤365d / monthly >365d) to fit LLM context windows
@@ -74,6 +74,8 @@ cn-fund-info/
 ├── SKILL.md              # Skill manifest (metadata + instructions for LLMs)
 ├── scripts/
 │   └── fund_info.py      # Main data fetching script
+├── tests/
+│   └── test_purchase_info.py
 ├── requirements.txt      # Python dependencies
 ├── README.md
 └── LICENSE

@@ -108,6 +108,27 @@ def safe_pct(val, default="N/A"):
         return str(val)
 
 
+def clean_value(val, default="N/A"):
+    """清理 akshare 返回值，保留数值原类型以便 JSON 输出。"""
+    if val is None:
+        return default
+    try:
+        if pd.isna(val):
+            return default
+    except (TypeError, ValueError):
+        pass
+    return val
+
+
+def display_value(val):
+    """Markdown 展示用：整数金额不显示 .0。"""
+    if val in (None, "N/A", ""):
+        return "N/A"
+    if isinstance(val, float) and val.is_integer():
+        return str(int(val))
+    return str(val)
+
+
 # ──────────────────────────────────────────
 # 数据获取函数
 # ──────────────────────────────────────────
@@ -183,7 +204,6 @@ def get_fee_info(code: str) -> dict:
         df = ak.fund_individual_detail_info_xq(symbol=code)
         mgmt_fee = "N/A"
         custody_fee = "N/A"
-        purchase_limit = "N/A"
 
         if df is not None and not df.empty:
             for _, row in df.iterrows():
@@ -200,15 +220,42 @@ def get_fee_info(code: str) -> dict:
         return {
             "management_fee": mgmt_fee,
             "custody_fee": custody_fee,
-            "purchase_limit": purchase_limit,
         }
     except Exception as e:
         return {
             "management_fee": "N/A",
             "custody_fee": "N/A",
-            "purchase_limit": "N/A",
             "error": str(e),
         }
+
+
+def get_purchase_info(code: str) -> dict:
+    """获取天天基金/东方财富口径的申购、赎回状态和日累计限额。"""
+    empty = {
+        "purchase_status": "N/A",
+        "redemption_status": "N/A",
+        "purchase_min": "N/A",
+        "daily_purchase_limit": "N/A",
+    }
+    try:
+        df = ak.fund_purchase_em()
+        if df is None or df.empty:
+            return {**empty, "error": "无申购状态数据"}
+
+        fund_codes = df["基金代码"].astype(str).str.zfill(6)
+        row = df[fund_codes == str(code).zfill(6)]
+        if row.empty:
+            return {**empty, "error": "未找到该基金申购状态"}
+
+        record = row.iloc[0]
+        return {
+            "purchase_status": clean_value(record.get("申购状态")),
+            "redemption_status": clean_value(record.get("赎回状态")),
+            "purchase_min": clean_value(record.get("购买起点")),
+            "daily_purchase_limit": clean_value(record.get("日累计限定金额")),
+        }
+    except Exception as e:
+        return {**empty, "error": str(e)}
 
 
 def get_nav_history(code: str, start: date, end: date) -> dict:
@@ -352,12 +399,18 @@ def render_markdown(data: dict) -> str:
     lines.append("## 基本信息")
     lines.append("| 字段 | 值 |")
     lines.append("|------|-----|")
+    purchase_status = meta.get("purchase_status")
+    if purchase_status in (None, "N/A", ""):
+        purchase_status = meta.get("status")
     fields = [
         ("基金类型", meta.get("type")),
         ("成立日期", meta.get("founded")),
         ("基金规模", meta.get("scale")),
         ("基金经理", meta.get("manager")),
-        ("申购状态", meta.get("status")),
+        ("申购状态", purchase_status),
+        ("赎回状态", meta.get("redemption_status")),
+        ("购买起点", display_value(meta.get("purchase_min"))),
+        ("日累计限定金额", display_value(meta.get("daily_purchase_limit"))),
         ("管理费率", meta.get("management_fee")),
         ("托管费率", meta.get("custody_fee")),
     ]
@@ -486,6 +539,9 @@ def main():
     print("正在获取费率信息...", file=sys.stderr)
     fee = get_fee_info(code)
 
+    print("正在获取申购/赎回状态...", file=sys.stderr)
+    purchase = get_purchase_info(code)
+
     print("正在获取净值历史...", file=sys.stderr)
     nav = get_nav_history(code, nav_start, nav_end)
 
@@ -506,6 +562,11 @@ def main():
             "scale": basic.get("scale", "N/A"),
             "manager": basic.get("manager", "N/A"),
             "status": basic.get("status", "N/A"),
+            "purchase_status": purchase.get("purchase_status", "N/A"),
+            "redemption_status": purchase.get("redemption_status", "N/A"),
+            "purchase_min": purchase.get("purchase_min", "N/A"),
+            "daily_purchase_limit": purchase.get("daily_purchase_limit", "N/A"),
+            "purchase_error": purchase.get("error"),
             "management_fee": fee.get("management_fee", "N/A"),
             "custody_fee": fee.get("custody_fee", "N/A"),
         },
