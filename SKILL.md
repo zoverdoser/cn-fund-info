@@ -4,7 +4,7 @@ description: Use when the user asks about a Chinese domestic mutual fund — fun
 license: MIT
 compatibility: Requires Python 3.8+ and the `akshare` and `pandas` packages. Network access required to fetch fund data.
 metadata:
-  version: "1.0"
+  version: '1.0'
 ---
 
 # cn-fund-info：国内公募基金信息查询
@@ -57,22 +57,22 @@ python scripts/fund_info.py 110011 --json
 
 ## Output Sections
 
-| Section | 说明 |
-|---------|------|
-| 基本信息 | 类型、成立日期、规模、经理、申购状态、赎回状态、购买起点、日累计限定金额、管理/托管费率 |
-| 业绩指标 | 近1月/3月/1年涨跌幅、同类排名、夏普比率（近1年）、最大回撤（近1年） |
-| 近期持仓 | 前十大重仓股：代码、名称、持仓占比、持仓市值（万元），注明报告期 |
-| 单位净值历史 | 自动采样：≤90天按日、91~365天按周、>365天按月；含累计净值和涨跌幅 |
+| Section      | 说明                                                                                    |
+| ------------ | --------------------------------------------------------------------------------------- |
+| 基本信息     | 类型、成立日期、规模、经理、申购状态、赎回状态、购买起点、日累计限定金额、管理/托管费率 |
+| 业绩指标     | 近1月/3月/1年涨跌幅、同类排名、夏普比率（近1年）、最大回撤（近1年）                     |
+| 近期持仓     | 前十大重仓股：代码、名称、持仓占比、持仓市值（万元），注明报告期                        |
+| 单位净值历史 | 自动采样：≤90天按日、91~365天按周、>365天按月；含累计净值和涨跌幅                       |
 
 ## Sampling Strategy
 
 净值数据根据时间跨度自动调整采样频率，防止超出 LLM 上下文窗口：
 
-| 时间跨度 | 采样 |
-|---------|------|
-| ≤ 90 天 | 按日 |
+| 时间跨度       | 采样 |
+| -------------- | ---- |
+| ≤ 90 天        | 按日 |
 | 91 天 ~ 365 天 | 按周 |
-| > 365 天 | 按月 |
+| > 365 天       | 按月 |
 
 ## Name Disambiguation
 
@@ -86,6 +86,7 @@ python scripts/fund_info.py 005827
 ```
 
 输出示例（节选）：
+
 ```
 # 基金信息：易方达蓝筹精选混合(005827)
 
@@ -107,9 +108,17 @@ python scripts/fund_info.py 005827
 
 ## Error Handling
 
-| 情况 | 脚本行为 |
-|------|---------|
-| 基金代码不存在 | 输出错误信息，退出码非0 |
-| 名称匹配多个 | 输出候选列表，退出码0 |
-| 某接口无数据 | 对应 section 显示 `> 暂无数据`，不影响其他 section |
-| akshare 未安装 | 明确提示 `pip install akshare pandas`，退出 |
+| 情况           | 脚本行为                                           |
+| -------------- | -------------------------------------------------- |
+| 基金代码不存在 | 输出错误信息，退出码非0                            |
+| 名称匹配多个   | 输出候选列表，退出码0                              |
+| 某接口无数据   | 对应 section 显示 `> 暂无数据`，不影响其他 section |
+| akshare 未安装 | 明确提示 `pip install akshare pandas`，退出        |
+
+## Codex Network Permission
+
+This script requires network access. In Codex sandboxed environments, request escalated permissions for the script-specific command prefix:
+
+["python", "<skill-root>/scripts/fund_info.py"]
+
+Resolve `<skill-root>` from the current skill installation path at runtime. Do not request broad approvals such as `["python"]`.
