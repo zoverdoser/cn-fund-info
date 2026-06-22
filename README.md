@@ -11,6 +11,7 @@ Outputs structured Markdown (tables + lists) that LLMs can easily reference in c
 - **Top 10 holdings**: code, name, ratio, market value — with report period
 - **NAV history**: with automatic sampling (daily ≤90d / weekly ≤365d / monthly >365d) to fit LLM context windows
 - **Name fuzzy search**: query by 6-digit code or Chinese fund name
+- **Fast purchase status checks**: batch `--purchase-only` queries load the full-market purchase table once and reuse a same-day cache
 
 ## Installation
 
@@ -46,15 +47,30 @@ python scripts/fund_info.py 110011
 # By fund name (fuzzy match)
 python scripts/fund_info.py "易方达蓝筹"
 
+# Fast purchase/redemption status and limit check for multiple funds
+python scripts/fund_info.py --purchase-only 000369 006282 006105
+
+# Alias for purchase-only
+python scripts/fund_info.py --status-only 000369 006282
+
+# Fetch only selected sections
+python scripts/fund_info.py --sections basic,purchase 110011
+
 # With custom NAV date range
 python scripts/fund_info.py 110011 --nav-start 2024-01-01 --nav-end 2024-12-31
 
 # Specify holdings report period (year)
 python scripts/fund_info.py 110011 --position-period 2023
 
+# Refresh or bypass the same-day purchase table cache
+python scripts/fund_info.py --purchase-only --refresh-cache 000369
+python scripts/fund_info.py --purchase-only --no-cache 000369
+
 # Raw JSON output (for debugging)
 python scripts/fund_info.py 110011 --json
 ```
+
+`--sections` accepts `basic,fee,purchase,nav,holdings,performance`. If omitted, the script keeps the original full-report behavior. Slow sections use a per-call timeout (`--timeout`, default 20 seconds) and return an unavailable/error marker instead of blocking the whole report. NAV requests pass the shortest akshare period that covers the requested date range, and the `nav` section can be skipped entirely.
 
 ## Requirements
 

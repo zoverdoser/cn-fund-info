@@ -45,11 +45,24 @@ python scripts/fund_info.py 110011
 # 按基金名称查询（模糊匹配）
 python scripts/fund_info.py "易方达蓝筹"
 
+# 快速查询申购/赎回状态和限购金额；支持批量，内部只拉一次全市场申购状态表
+python scripts/fund_info.py --purchase-only 000369 006282 006105
+
+# --purchase-only 的别名
+python scripts/fund_info.py --status-only 000369 006282
+
+# 只查询指定模块
+python scripts/fund_info.py --sections basic,purchase 110011
+
 # 指定净值时间范围
 python scripts/fund_info.py 110011 --nav-start 2024-01-01 --nav-end 2024-12-31
 
 # 指定持仓报告期（年份）
 python scripts/fund_info.py 110011 --position-period 2023
+
+# 刷新或禁用当日申购状态缓存
+python scripts/fund_info.py --purchase-only --refresh-cache 000369
+python scripts/fund_info.py --purchase-only --no-cache 000369
 
 # 输出原始 JSON（调试用）
 python scripts/fund_info.py 110011 --json
@@ -63,6 +76,8 @@ python scripts/fund_info.py 110011 --json
 | 业绩指标     | 近1月/3月/1年涨跌幅、同类排名、夏普比率（近1年）、最大回撤（近1年）                     |
 | 近期持仓     | 前十大重仓股：代码、名称、持仓占比、持仓市值（万元），注明报告期                        |
 | 单位净值历史 | 自动采样：≤90天按日、91~365天按周、>365天按月；含累计净值和涨跌幅                       |
+
+`--sections` 支持 `basic,fee,purchase,nav,holdings,performance`。若不指定，保持原完整报告行为。净值模块会按日期范围传入能覆盖该区间的最短 akshare period；如无需净值，可不选择 `nav` section。
 
 ## Sampling Strategy
 
@@ -113,7 +128,12 @@ python scripts/fund_info.py 005827
 | 基金代码不存在 | 输出错误信息，退出码非0                            |
 | 名称匹配多个   | 输出候选列表，退出码0                              |
 | 某接口无数据   | 对应 section 显示 `> 暂无数据`，不影响其他 section |
+| 慢接口超时     | 对应 section 返回 `unavailable` 和错误信息，不阻塞其他 section |
 | akshare 未安装 | 明确提示 `pip install akshare pandas`，退出        |
+
+## Purchase Status Cache
+
+`fund_purchase_em()` 会按自然日缓存到 `/tmp/cn-fund-info/fund_purchase_em_YYYY-MM-DD.csv`。同一天再次查询默认复用缓存；使用 `--refresh-cache` 强制刷新，或 `--no-cache` 禁用缓存。
 
 ## Codex Network Permission
 

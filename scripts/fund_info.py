@@ -7,7 +7,11 @@ cn-fund-info: 获取国内公募基金信息
 import argparse
 import sys
 import json
+import signal
+import tempfile
+import threading
 from datetime import datetime, timedelta, date
+from pathlib import Path
 
 try:
     import akshare as ak
@@ -40,6 +44,15 @@ COLUMN_MAP = {
     "百分比": "rank_pct",
 }
 
+DEFAULT_SECTIONS = {"basic", "fee", "purchase", "nav", "holdings", "performance"}
+PURCHASE_CACHE_DIR = Path(tempfile.gettempdir()) / "cn-fund-info"
+PURCHASE_EMPTY = {
+    "purchase_status": "N/A",
+    "redemption_status": "N/A",
+    "purchase_min": "N/A",
+    "daily_purchase_limit": "N/A",
+}
+
 
 def normalize_columns(df: "pd.DataFrame") -> "pd.DataFrame":
     """将 DataFrame 列名统一映射为英文 key。"""
@@ -55,6 +68,23 @@ def parse_date(s: str) -> date:
 
 def date_range_days(start: date, end: date) -> int:
     return (end - start).days
+
+
+def nav_period_for_range(start: date, end: date) -> str:
+    days = date_range_days(start, end)
+    if days <= 31:
+        return "1月"
+    if days <= 93:
+        return "3月"
+    if days <= 186:
+        return "6月"
+    if days <= 366:
+        return "1年"
+    if days <= 366 * 3:
+        return "3年"
+    if days <= 366 * 5:
+        return "5年"
+    return "成立来"
 
 
 def sample_nav(df: "pd.DataFrame", start: date, end: date) -> "pd.DataFrame":
@@ -127,6 +157,125 @@ def display_value(val):
     if isinstance(val, float) and val.is_integer():
         return str(int(val))
     return str(val)
+
+
+class SectionTimeout(Exception):
+    pass
+
+
+def _timeout_handler(signum, frame):
+    raise SectionTimeout()
+
+
+def run_with_timeout(label: str, func, timeout_seconds: float = 20, fallback=None, *args, **kwargs):
+    """Run a data-fetching section with a best-effort wall-clock timeout."""
+    if timeout_seconds is None or timeout_seconds <= 0:
+        return func(*args, **kwargs)
+
+    if hasattr(signal, "SIGALRM") and threading.current_thread() is threading.main_thread():
+        previous_handler = signal.getsignal(signal.SIGALRM)
+        signal.signal(signal.SIGALRM, _timeout_handler)
+        signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
+        try:
+            return func(*args, **kwargs)
+        except SectionTimeout:
+            error = f"{label} timeout after {timeout_seconds:g}s"
+            if isinstance(fallback, pd.DataFrame):
+                result = fallback.copy()
+                result.attrs["unavailable"] = True
+                result.attrs["error"] = error
+                return result
+            result = dict(fallback) if fallback is not None else {}
+            result["unavailable"] = True
+            result["error"] = error
+            return result
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous_handler)
+
+    return func(*args, **kwargs)
+
+
+def purchase_cache_path(cache_dir=None, today: date = None) -> Path:
+    day = today or date.today()
+    return Path(cache_dir or PURCHASE_CACHE_DIR) / f"fund_purchase_em_{day.isoformat()}.csv"
+
+
+def load_purchase_table(cache_dir=None, refresh: bool = False, no_cache: bool = False) -> "pd.DataFrame":
+    """Load the full-market purchase table once, using a same-day cache by default."""
+    cache_path = purchase_cache_path(cache_dir)
+    if not no_cache and not refresh and cache_path.exists():
+        return pd.read_csv(cache_path, dtype={"基金代码": str})
+
+    try:
+        df = ak.fund_purchase_em()
+    except Exception as e:
+        result = pd.DataFrame()
+        result.attrs["error"] = str(e)
+        result.attrs["unavailable"] = True
+        return result
+
+    if df is None:
+        return pd.DataFrame()
+
+    if not no_cache:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = cache_path.with_suffix(".tmp")
+        df.to_csv(tmp_path, index=False)
+        tmp_path.replace(cache_path)
+
+    return df
+
+
+def lookup_purchase_info(df: "pd.DataFrame", code: str) -> dict:
+    """Look up one fund's purchase status from an already-loaded purchase table."""
+    normalized_code = str(code).zfill(6)
+    empty = {"code": normalized_code, "name": "N/A", **PURCHASE_EMPTY}
+    if df is None or df.empty:
+        error = getattr(df, "attrs", {}).get("error") if df is not None else None
+        return {**empty, "error": error or "无申购状态数据"}
+    if "基金代码" not in df.columns:
+        return {**empty, "error": "申购状态表缺少基金代码列"}
+
+    fund_codes = df["基金代码"].astype(str).str.replace(r"\.0$", "", regex=True).str.zfill(6)
+    row = df[fund_codes == normalized_code]
+    if row.empty:
+        return {**empty, "error": "未找到该基金申购状态"}
+
+    record = row.iloc[0]
+    return {
+        "code": normalized_code,
+        "name": clean_value(record.get("基金简称", record.get("基金名称", "N/A"))),
+        "purchase_status": clean_value(record.get("申购状态")),
+        "redemption_status": clean_value(record.get("赎回状态")),
+        "purchase_min": clean_value(record.get("购买起点")),
+        "daily_purchase_limit": clean_value(record.get("日累计限定金额")),
+    }
+
+
+def parse_sections(value: str = None) -> set:
+    if not value:
+        return set(DEFAULT_SECTIONS)
+
+    aliases = {
+        "all": DEFAULT_SECTIONS,
+        "fees": {"fee"},
+        "status": {"purchase"},
+        "purchase-only": {"purchase"},
+    }
+    sections = set()
+    for raw in value.split(","):
+        item = raw.strip().lower()
+        if not item:
+            continue
+        mapped = aliases.get(item)
+        if isinstance(mapped, set):
+            sections.update(mapped)
+        elif item in DEFAULT_SECTIONS:
+            sections.add(item)
+        else:
+            raise ValueError(f"未知 section：{raw}")
+    return sections
 
 
 # ──────────────────────────────────────────
@@ -231,44 +380,25 @@ def get_fee_info(code: str) -> dict:
 
 def get_purchase_info(code: str) -> dict:
     """获取天天基金/东方财富口径的申购、赎回状态和日累计限额。"""
-    empty = {
-        "purchase_status": "N/A",
-        "redemption_status": "N/A",
-        "purchase_min": "N/A",
-        "daily_purchase_limit": "N/A",
-    }
     try:
-        df = ak.fund_purchase_em()
-        if df is None or df.empty:
-            return {**empty, "error": "无申购状态数据"}
-
-        fund_codes = df["基金代码"].astype(str).str.zfill(6)
-        row = df[fund_codes == str(code).zfill(6)]
-        if row.empty:
-            return {**empty, "error": "未找到该基金申购状态"}
-
-        record = row.iloc[0]
-        return {
-            "purchase_status": clean_value(record.get("申购状态")),
-            "redemption_status": clean_value(record.get("赎回状态")),
-            "purchase_min": clean_value(record.get("购买起点")),
-            "daily_purchase_limit": clean_value(record.get("日累计限定金额")),
-        }
+        result = lookup_purchase_info(load_purchase_table(), code)
+        return {key: value for key, value in result.items() if key not in {"code", "name"}}
     except Exception as e:
-        return {**empty, "error": str(e)}
+        return {**PURCHASE_EMPTY, "error": str(e)}
 
 
 def get_nav_history(code: str, start: date, end: date) -> dict:
     """获取单位净值历史（含累计净值）。"""
     try:
-        df = ak.fund_open_fund_info_em(symbol=code, indicator="单位净值走势", period="成立来")
+        period = nav_period_for_range(start, end)
+        df = ak.fund_open_fund_info_em(symbol=code, indicator="单位净值走势", period=period)
         df = normalize_columns(df)
         if df.empty:
             return {"sample_period": "daily", "records": [], "error": "无数据"}
 
         # 获取累计净值并合并
         try:
-            df_accum = ak.fund_open_fund_info_em(symbol=code, indicator="累计净值走势", period="成立来")
+            df_accum = ak.fund_open_fund_info_em(symbol=code, indicator="累计净值走势", period=period)
             df_accum = normalize_columns(df_accum)
             if not df_accum.empty and "accum_value" in df_accum.columns:
                 df_accum["date"] = pd.to_datetime(df_accum["date"])
@@ -381,6 +511,26 @@ def get_performance(code: str) -> dict:
 # ──────────────────────────────────────────
 # Markdown 渲染
 # ──────────────────────────────────────────
+def render_purchase_table(results: list) -> str:
+    lines = [
+        "| 基金代码 | 基金名称 | 申购状态 | 赎回状态 | 购买起点 | 日累计限定金额 | 错误 |",
+        "|---------|---------|---------|---------|---------|---------------|------|",
+    ]
+    for item in results:
+        lines.append(
+            "| {code} | {name} | {purchase_status} | {redemption_status} | {purchase_min} | {daily_purchase_limit} | {error} |".format(
+                code=item.get("code", "N/A"),
+                name=display_value(item.get("name")),
+                purchase_status=display_value(item.get("purchase_status")),
+                redemption_status=display_value(item.get("redemption_status")),
+                purchase_min=display_value(item.get("purchase_min")),
+                daily_purchase_limit=display_value(item.get("daily_purchase_limit")),
+                error=display_value(item.get("error", "")).replace("N/A", ""),
+            )
+        )
+    return "\n".join(lines)
+
+
 def render_markdown(data: dict) -> str:
     meta = data.get("metadata", {})
     alloc = data.get("allocation", {})
@@ -430,64 +580,67 @@ def render_markdown(data: dict) -> str:
         lines.append("")
 
     # 业绩指标
-    lines.append("## 业绩指标")
-    lines.append("| 指标 | 数值 |")
-    lines.append("|------|------|")
-    perf_fields = [
-        ("近1月涨跌幅", perf.get("return_1m")),
-        ("近3月涨跌幅", perf.get("return_3m")),
-        ("近1年涨跌幅", perf.get("return_1y")),
-        ("同类排名(近1年)", perf.get("rank_1y")),
-        ("夏普比率(近1年)", perf.get("sharpe_1y")),
-        ("最大回撤(近1年)", perf.get("max_drawdown_1y")),
-    ]
-    for label, val in perf_fields:
-        display = val if val not in (None, "N/A") else "暂无数据"
-        lines.append(f"| {label} | {display} |")
-    lines.append("")
+    if "performance" in data:
+        lines.append("## 业绩指标")
+        lines.append("| 指标 | 数值 |")
+        lines.append("|------|------|")
+        perf_fields = [
+            ("近1月涨跌幅", perf.get("return_1m")),
+            ("近3月涨跌幅", perf.get("return_3m")),
+            ("近1年涨跌幅", perf.get("return_1y")),
+            ("同类排名(近1年)", perf.get("rank_1y")),
+            ("夏普比率(近1年)", perf.get("sharpe_1y")),
+            ("最大回撤(近1年)", perf.get("max_drawdown_1y")),
+        ]
+        for label, val in perf_fields:
+            display = val if val not in (None, "N/A") else "暂无数据"
+            lines.append(f"| {label} | {display} |")
+        lines.append("")
 
     # 持仓
-    period = holdings.get("period", "N/A")
-    update_date = holdings.get("update_date", "N/A")
-    top10 = holdings.get("top10", [])
-    if holdings.get("error"):
-        lines.append(f"## 近期持仓({period})")
-        lines.append(f"> {holdings['error']}\n")
-    elif top10:
-        lines.append(f"## 近期持仓({period}，报告期：{update_date})")
-        lines.append("| 排名 | 代码 | 名称 | 持仓占比 | 持仓市值(万元) |")
-        lines.append("|------|------|------|---------|----------------|")
-        for h in top10:
-            ratio_str = f"{h['ratio']:.2f}%" if h.get("ratio") else "N/A"
-            val_str = f"{h['value_million']:.0f}" if h.get("value_million") else "N/A"
-            lines.append(f"| {h['rank']} | {h['code']} | {h['name']} | {ratio_str} | {val_str} |")
-        lines.append("")
-    else:
-        lines.append(f"## 近期持仓({period})")
-        lines.append("> 暂无持仓数据\n")
+    if "holdings" in data:
+        period = holdings.get("period", "N/A")
+        update_date = holdings.get("update_date", "N/A")
+        top10 = holdings.get("top10", [])
+        if holdings.get("error"):
+            lines.append(f"## 近期持仓({period})")
+            lines.append(f"> {holdings['error']}\n")
+        elif top10:
+            lines.append(f"## 近期持仓({period}，报告期：{update_date})")
+            lines.append("| 排名 | 代码 | 名称 | 持仓占比 | 持仓市值(万元) |")
+            lines.append("|------|------|------|---------|----------------|")
+            for h in top10:
+                ratio_str = f"{h['ratio']:.2f}%" if h.get("ratio") else "N/A"
+                val_str = f"{h['value_million']:.0f}" if h.get("value_million") else "N/A"
+                lines.append(f"| {h['rank']} | {h['code']} | {h['name']} | {ratio_str} | {val_str} |")
+            lines.append("")
+        else:
+            lines.append(f"## 近期持仓({period})")
+            lines.append("> 暂无持仓数据\n")
 
     # 净值历史
-    records = nav.get("records", [])
-    sp = nav.get("sample_period", "daily")
-    sp_label = {"daily": "按日", "weekly": "按周", "monthly": "按月"}.get(sp, sp)
-    if nav.get("error"):
-        lines.append("## 单位净值历史")
-        lines.append(f"> {nav['error']}\n")
-    elif records:
-        start_d = records[0]["date"] if records else "N/A"
-        end_d = records[-1]["date"] if records else "N/A"
-        lines.append(f"## 单位净值历史({sp_label}采样，{start_d} ~ {end_d}，共 {len(records)} 条)")
-        lines.append("| 日期 | 单位净值 | 累计净值 | 涨跌幅 |")
-        lines.append("|------|---------|---------|-------|")
-        for rec in records:
-            nv = f"{rec['net_value']:.4f}" if rec.get("net_value") else "N/A"
-            av = f"{rec['accum_value']:.4f}" if rec.get("accum_value") else "N/A"
-            ch = rec.get("daily_change", "N/A")
-            lines.append(f"| {rec['date']} | {nv} | {av} | {ch} |")
-        lines.append("")
-    else:
-        lines.append("## 单位净值历史")
-        lines.append("> 暂无净值数据\n")
+    if "nav_history" in data:
+        records = nav.get("records", [])
+        sp = nav.get("sample_period", "daily")
+        sp_label = {"daily": "按日", "weekly": "按周", "monthly": "按月"}.get(sp, sp)
+        if nav.get("error"):
+            lines.append("## 单位净值历史")
+            lines.append(f"> {nav['error']}\n")
+        elif records:
+            start_d = records[0]["date"] if records else "N/A"
+            end_d = records[-1]["date"] if records else "N/A"
+            lines.append(f"## 单位净值历史({sp_label}采样，{start_d} ~ {end_d}，共 {len(records)} 条)")
+            lines.append("| 日期 | 单位净值 | 累计净值 | 涨跌幅 |")
+            lines.append("|------|---------|---------|-------|")
+            for rec in records:
+                nv = f"{rec['net_value']:.4f}" if rec.get("net_value") else "N/A"
+                av = f"{rec['accum_value']:.4f}" if rec.get("accum_value") else "N/A"
+                ch = rec.get("daily_change", "N/A")
+                lines.append(f"| {rec['date']} | {nv} | {av} | {ch} |")
+            lines.append("")
+        else:
+            lines.append("## 单位净值历史")
+            lines.append("> 暂无净值数据\n")
 
     return "\n".join(lines)
 
@@ -495,68 +648,68 @@ def render_markdown(data: dict) -> str:
 # ──────────────────────────────────────────
 # 主流程
 # ──────────────────────────────────────────
-def main():
-    parser = argparse.ArgumentParser(
-        description="获取国内公募基金信息（基于 akshare）",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-示例:
-  python fund_info.py 110011
-  python fund_info.py "易方达蓝筹"
-  python fund_info.py 110011 --nav-start 2023-01-01 --nav-end 2024-12-31
-  python fund_info.py 110011 --position-period 2023
-        """,
-    )
-    parser.add_argument("query", help="6位基金代码 或 基金名称（支持模糊匹配）")
-    parser.add_argument("--nav-start", help="净值起始日期 YYYY-MM-DD（默认：近90天）")
-    parser.add_argument("--nav-end", help="净值结束日期 YYYY-MM-DD（默认：今天）")
-    parser.add_argument(
-        "--position-period",
-        default=str(datetime.now().year),
-        help="持仓报告期，格式 YYYY 或 YYYYQ? 例如 2024 或 2024Q3（默认：当前年份）",
-    )
-    parser.add_argument("--json", action="store_true", help="输出原始 JSON（调试用）")
-    args = parser.parse_args()
+def default_basic(code: str) -> dict:
+    return {
+        "code": code, "name": "N/A", "short_name": "N/A", "type": "N/A",
+        "founded": "N/A", "scale": "N/A", "manager": "N/A", "status": "N/A",
+    }
 
-    # 解析日期
-    today = date.today()
-    nav_end = parse_date(args.nav_end) if args.nav_end else today
-    nav_start = parse_date(args.nav_start) if args.nav_start else today - timedelta(days=90)
 
-    # 解析持仓期（支持 2024Q3 → "2024"），akshare 只接受年份
-    position_period = args.position_period
-    if "Q" in position_period.upper():
-        position_period = position_period.split("Q")[0].split("q")[0]
+def default_fee() -> dict:
+    return {"management_fee": "N/A", "custody_fee": "N/A"}
 
-    # 解析基金代码
-    print("正在解析基金代码...", file=sys.stderr)
-    code = resolve_fund_code(args.query)
 
-    # 顺序获取各项数据
-    print("正在获取基础信息...", file=sys.stderr)
-    basic = get_basic_info(code)
+def default_nav() -> dict:
+    return {"sample_period": "daily", "records": []}
 
-    print("正在获取费率信息...", file=sys.stderr)
-    fee = get_fee_info(code)
 
-    print("正在获取申购/赎回状态...", file=sys.stderr)
-    purchase = get_purchase_info(code)
+def default_holdings(period: str) -> dict:
+    return {"period": period, "update_date": "N/A", "top10": []}
 
-    print("正在获取净值历史...", file=sys.stderr)
-    nav = get_nav_history(code, nav_start, nav_end)
 
-    print("正在获取持仓数据...", file=sys.stderr)
-    holdings = get_holdings(code, position_period)
+def default_performance() -> dict:
+    return {
+        "return_1m": "N/A",
+        "return_3m": "N/A",
+        "return_1y": "N/A",
+        "rank_1y": "N/A",
+        "sharpe_1y": "N/A",
+        "max_drawdown_1y": "N/A",
+    }
 
-    print("正在获取业绩指标...", file=sys.stderr)
-    perf = get_performance(code)
 
-    # 构建统一 JSON
+def build_fund_data(
+    code: str,
+    sections: set,
+    nav_start: date,
+    nav_end: date,
+    position_period: str,
+    timeout_seconds: float,
+    purchase_table=None,
+) -> dict:
+    basic = default_basic(code)
+    fee = default_fee()
+    purchase = dict(PURCHASE_EMPTY)
+    purchase["code"] = code
+    purchase["name"] = "N/A"
+
+    if "basic" in sections:
+        print("正在获取基础信息...", file=sys.stderr)
+        basic = run_with_timeout("basic", get_basic_info, timeout_seconds, default_basic(code), code)
+
+    if "fee" in sections:
+        print("正在获取费率信息...", file=sys.stderr)
+        fee = run_with_timeout("fee", get_fee_info, timeout_seconds, default_fee(), code)
+
+    if "purchase" in sections:
+        print("正在获取申购/赎回状态...", file=sys.stderr)
+        purchase = lookup_purchase_info(purchase_table, code)
+
     data = {
         "metadata": {
             "code": code,
-            "name": basic.get("name", "N/A"),
-            "short_name": basic.get("short_name", "N/A"),
+            "name": basic.get("name") or purchase.get("name", "N/A"),
+            "short_name": basic.get("short_name") if basic.get("short_name") != "N/A" else purchase.get("name", "N/A"),
             "type": basic.get("type", "N/A"),
             "founded": basic.get("founded", "N/A"),
             "scale": basic.get("scale", "N/A"),
@@ -571,15 +724,110 @@ def main():
             "custody_fee": fee.get("custody_fee", "N/A"),
         },
         "allocation": {"records": []},
-        "performance": perf,
-        "holdings": holdings,
-        "nav_history": nav,
     }
 
+    if "performance" in sections:
+        print("正在获取业绩指标...", file=sys.stderr)
+        data["performance"] = run_with_timeout(
+            "performance", get_performance, timeout_seconds, default_performance(), code
+        )
+
+    if "holdings" in sections:
+        print("正在获取持仓数据...", file=sys.stderr)
+        data["holdings"] = run_with_timeout(
+            "holdings", get_holdings, timeout_seconds, default_holdings(position_period), code, position_period
+        )
+
+    if "nav" in sections:
+        print("正在获取净值历史...", file=sys.stderr)
+        data["nav_history"] = run_with_timeout(
+            "nav", get_nav_history, timeout_seconds, default_nav(), code, nav_start, nav_end
+        )
+
+    return data
+
+
+def resolve_queries(queries: list) -> list:
+    print("正在解析基金代码...", file=sys.stderr)
+    return [resolve_fund_code(query) for query in queries]
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="获取国内公募基金信息（基于 akshare）",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  python fund_info.py 110011
+  python fund_info.py "易方达蓝筹"
+  python fund_info.py --purchase-only 000369 006282 006105
+  python fund_info.py --sections basic,purchase 110011
+  python fund_info.py 110011 --nav-start 2023-01-01 --nav-end 2024-12-31
+  python fund_info.py 110011 --position-period 2023
+        """,
+    )
+    parser.add_argument("queries", nargs="+", help="一个或多个 6 位基金代码或基金名称（支持模糊匹配）")
+    parser.add_argument("--nav-start", help="净值起始日期 YYYY-MM-DD（默认：近90天）")
+    parser.add_argument("--nav-end", help="净值结束日期 YYYY-MM-DD（默认：今天）")
+    parser.add_argument(
+        "--position-period",
+        default=str(datetime.now().year),
+        help="持仓报告期，格式 YYYY 或 YYYYQ? 例如 2024 或 2024Q3（默认：当前年份）",
+    )
+    parser.add_argument("--purchase-only", action="store_true", help="只输出申购/赎回状态、购买起点和日限额")
+    parser.add_argument("--status-only", action="store_true", help="--purchase-only 的别名")
+    parser.add_argument("--sections", help="逗号分隔的数据模块：basic,fee,purchase,nav,holdings,performance")
+    parser.add_argument("--refresh-cache", action="store_true", help="强制刷新当日申购状态缓存")
+    parser.add_argument("--no-cache", action="store_true", help="禁用申购状态缓存")
+    parser.add_argument("--timeout", type=float, default=20, help="单个慢接口的超时时间（秒，默认：20）")
+    parser.add_argument("--json", action="store_true", help="输出原始 JSON（调试用）")
+    args = parser.parse_args()
+
+    # 解析日期
+    today = date.today()
+    nav_end = parse_date(args.nav_end) if args.nav_end else today
+    nav_start = parse_date(args.nav_start) if args.nav_start else today - timedelta(days=90)
+
+    # 解析持仓期（支持 2024Q3 → "2024"），akshare 只接受年份
+    position_period = args.position_period
+    if "Q" in position_period.upper():
+        position_period = position_period.split("Q")[0].split("q")[0]
+
+    try:
+        sections = {"purchase"} if (args.purchase_only or args.status_only) else parse_sections(args.sections)
+    except ValueError as e:
+        parser.error(str(e))
+
+    codes = resolve_queries(args.queries)
+    purchase_table = None
+    if "purchase" in sections:
+        purchase_table = run_with_timeout(
+            "purchase",
+            load_purchase_table,
+            args.timeout,
+            pd.DataFrame(),
+            refresh=args.refresh_cache,
+            no_cache=args.no_cache,
+        )
+
+    if args.purchase_only or args.status_only:
+        results = [lookup_purchase_info(purchase_table, code) for code in codes]
+        if args.json:
+            print(json.dumps(results, ensure_ascii=False, indent=2, default=str))
+        else:
+            print(render_purchase_table(results))
+        return
+
+    outputs = [
+        build_fund_data(code, sections, nav_start, nav_end, position_period, args.timeout, purchase_table)
+        for code in codes
+    ]
+
     if args.json:
-        print(json.dumps(data, ensure_ascii=False, indent=2, default=str))
+        payload = outputs[0] if len(outputs) == 1 else outputs
+        print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
     else:
-        print(render_markdown(data))
+        print("\n\n---\n\n".join(render_markdown(data) for data in outputs))
 
 
 if __name__ == "__main__":
